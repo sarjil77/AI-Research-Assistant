@@ -1,66 +1,23 @@
 # from asyncio import tools
-import json
-import ollama
+import asyncio
 from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-import json
+from utils.logger import create_logger
 import os
+import json
 
-class mcp_internet_search():
-    def __init__(self, query: str):
-        self.query=query
-        self.TOOL_PROMPT = """
-            You are an AI research assistant with access to external tools.
-
-            Available tools:
-
-            1. internet_search(query, max_results)
-            - Use for general web search, news, blogs, documentation, comparisons.
-
-            2. arxiv_paper_search(query, max_results)
-            - Use ONLY for academic or research paper discovery (ML, AI, CS, etc.).
-
-            3. search_repositories(query)
-            - Use to find GitHub repositories related to a topic, library, or project.
-
-            4. search_code(query)
-            - Use to search for specific implementations, functions, or patterns in GitHub code.
-
-            5. get_file_contents(owner, repo, path)
-            - Use to read a specific file from a GitHub repository.
-
-            6. list_issues(owner, repo)
-            - Use to inspect open issues, bugs, or discussions in a GitHub repo.
-
-            7. list_pull_requests(owner, repo)
-            - Use to inspect recent development activity or changes.
-
-            Guidelines:
-            - Choose EXACTLY ONE tool if a tool is required.
-            - Prefer GitHub tools for:
-            - Code, implementations, repos, issues, PRs
-            - Prefer arxiv_paper_search for:
-            - Academic papers, surveys, research work
-            - Prefer internet_search for:
-            - Everything else
-            - If no tool is needed, return null.
-
-            Respond ONLY in valid JSON.
-            No explanations, no markdown, no extra text.
-
-            Output format:
-            {
-            "tool": "internet_search | arxiv_paper_search | search_repositories | search_code | get_file_contents | list_issues | list_pull_requests | null",
-            "args": {
-                "query": "...",
-                "max_results": 5
-            }
-            }
-        """
-
+class MCPManager:
+    def __init__(self):
+        self.custom_session = None
+        self.gh_session = None
+        self.all_tools = {}
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0
+        )
+    
     def textcontent_to_string(self,content):
         if isinstance(content, list):
             return [self.textcontent_to_string(c) for c in content]
@@ -70,119 +27,127 @@ class mcp_internet_search():
 
         return content
 
-    async def mcp_search(self, max_results: int = 5):
 
+    async def startup(self):
         server_params = StdioServerParameters(
             command="python",
             args=["src/custom_mcp_server.py"],
         )
 
-
-
         github_params = StdioServerParameters(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-github@latest"],
+            command="mcp-server-github",
+            args=[],
             env={
                 "GITHUB_PERSONAL_ACCESS_TOKEN": os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
             }
         )
 
-        async with stdio_client(server_params) as (custom_read, custom_write), \
-                stdio_client(github_params) as (gh_read, gh_write):
+        # Start stdio clients
+        self.custom_client_ctx = stdio_client(server_params)
+        self.github_client_ctx = stdio_client(github_params)
 
-            async with ClientSession(custom_read, custom_write) as custom_session, \
-                    ClientSession(gh_read, gh_write) as gh_session:
+        custom_read, custom_write = await self.custom_client_ctx.__aenter__()
+        gh_read, gh_write = await self.github_client_ctx.__aenter__()
 
-                # Initialize
-                await custom_session.initialize()
-                await gh_session.initialize()
+        self.custom_session_ctx = ClientSession(custom_read, custom_write)
+        self.gh_session_ctx = ClientSession(gh_read, gh_write)
 
-                # Discover tools
-                custom_tools = (await custom_session.list_tools()).tools
-                gh_tools = (await gh_session.list_tools()).tools
+        self.custom_session = await self.custom_session_ctx.__aenter__()
+        self.gh_session = await self.gh_session_ctx.__aenter__()
 
-                all_tools = {t.name: ("custom", t) for t in custom_tools}
-                all_tools.update({t.name: ("github", t) for t in gh_tools})
+        await self.custom_session.initialize()
+        await self.gh_session.initialize()
 
-                # print("Available MCP tools:", list(all_tools.keys()))
+        custom_tools = (await self.custom_session.list_tools()).tools
+        gh_tools = (await self.gh_session.list_tools()).tools
 
-                llm = ChatOpenAI(
-                    model="gpt-4o-mini",
-                    temperature=0
-                )
+        self.all_tools = {t.name: ("custom", t) for t in custom_tools}
+        self.all_tools.update({t.name: ("github", t) for t in gh_tools})
 
-                # Tool decision (LLM)
-                decision = await llm.ainvoke(
-                    f"{self.TOOL_PROMPT}\n\nUser query:\n{self.query}"
-                )
-                # print("LLM tool decision:", decision.content)
+        self.openai_tools = [
+            self.convert_mcp_tool_to_openai_schema(t)
+            for _, t in self.all_tools.values()
+        ]
 
-                try:
-                    tool_decision = json.loads(decision.content)
-                    print("Parsed tool decision:", tool_decision)
-                except Exception:
-                    return decision.content
+    async def shutdown(self):
+        await self.custom_client_ctx.__aexit__(None, None, None)
+        await self.github_client_ctx.__aexit__(None, None, None)
 
-                tool_name = tool_decision.get("tool")
-                tool_args = tool_decision.get("args", {})
+    def convert_mcp_tool_to_openai_schema(self, tool):
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema
+            }
+        }
 
-                if not tool_name or tool_name not in all_tools:
-                    return decision.content
+    async def mcp_search(self, query: str):
 
-                # Security allow-list
-                ALLOWED_TOOLS = {
-                    "internet_search",
-                    "arxiv_paper_search",
-                    "search_repositories",
-                    "get_file_contents",
-                    "list_issues",
-                    "search_code",
-                    "list_pull_requests"
-                }
+        response = await self.llm.ainvoke(
+            query,
+            tools=self.openai_tools,
+            tool_choice="auto"
+        )
+        # If model wants to call tool
+        if response.tool_calls:
+            tool_call = response.tool_calls[0]
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
 
-                if tool_name not in ALLOWED_TOOLS:
-                    return decision.content
+            source, _ = self.all_tools[tool_name]
 
-                source, _ = all_tools[tool_name]
-                print(f"Calling {source} tool: {tool_name} with args {tool_args}")
-
-                # Execute tool
+            try:
                 if source == "custom":
-                    tool_response = await custom_session.call_tool(tool_name, tool_args)
+                    tool_response = await asyncio.wait_for(
+                        self.custom_session.call_tool(tool_name, tool_args),
+                        timeout=15
+                    )
                 else:
-                    tool_response = await gh_session.call_tool(
-                        tool_name,
-                        {
-                            "query": tool_args["query"],
-                            "per_page": tool_args.get("max_results", max_results),
-                        }
+                    tool_response = await asyncio.wait_for(
+                        self.gh_session.call_tool(
+                            tool_name,
+                            {
+                                "query": tool_args.get("query"),
+                                "per_page": tool_args.get("max_results", 5),
+                            }
+                        ),
+                        timeout=15
                     )
 
-                tool_output = self.textcontent_to_string(tool_response.content)
+            except asyncio.TimeoutError:
+                return f"Tool '{tool_name}' timed out after 15 seconds."
 
-                # FINAL LLM CALL (THIS WAS MISSING)
-                final_prompt = f"""
-                    You are an AI assistant.
+            except Exception as e:
+                return f"Tool '{tool_name}' failed with error: {str(e)}"
 
-                    User query:
-                    {self.query}
+            tool_output = self.textcontent_to_string(tool_response.content)
 
-                    Tool selected by LLM response:
-                    {decision}
+            # Normalize
+            if isinstance(tool_output, list):
+                tool_output = json.dumps(tool_output)
 
-                    Tool selected:
-                    {tool_name}
+            tool_output = str(tool_output)
 
-                    Tool arguments:
-                    {json.dumps(tool_args, indent=2)}
+            # Hard safety cap
+            MAX_TOOL_CHARS = 8000
+            if len(tool_output) > MAX_TOOL_CHARS:
+                tool_output = tool_output[:MAX_TOOL_CHARS] + "\n\n[TRUNCATED]"
 
-                    Tool response:
-                    {tool_output}
+            # Send tool result back to model
+            final = await self.llm.ainvoke(
+                [
+                    {"role": "user", "content": query},
+                    response,
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": str(tool_output),
+                    },
+                ]
+            )
 
-                    Using the tool response above, provide a clear and concise final answer to the user.
-                    Do NOT mention tools or internal decisions.
-                    """
+            return final.content
 
-                final_answer = await llm.ainvoke(final_prompt)
-
-                return final_answer.content
+        return response.content

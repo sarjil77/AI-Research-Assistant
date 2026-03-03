@@ -1,14 +1,19 @@
 from schemas.agent_state import AgentState
-from src.mcp_search_client import mcp_internet_search
 
 # -------- Node 1: Research --------
 async def internet_search(state: AgentState) -> AgentState:
     query = state["query"]
-    mcp= mcp_internet_search(query)
-    results = await(
-        mcp.mcp_search(max_results=5)
+
+    # Get persistent manager from state
+    mcp_manager = state.get("mcp_manager")
+    print("Available tools:", state["mcp_manager"].all_tools.keys())
+
+    if mcp_manager is None:
+        raise RuntimeError("MCP Manager not found in state")
+
+    results = await mcp_manager.mcp_search(
+        query=query
     )
-    # print("Proper results: ",results)
 
     state["response"] = results
     state.setdefault("research_agent", []).append(results)

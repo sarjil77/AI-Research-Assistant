@@ -41,7 +41,7 @@ def build_research_agent():
     return graph.compile()
 
 # -------- Run Workflow --------
-async def run_workflow(query: str, files: list[str], logger) -> str:
+async def run_workflow(query: str, files: list[str], mcp_manager, logger) -> str:
     graph = build_research_agent()
 
     documents = ingest_files(files) if files else []
@@ -54,14 +54,22 @@ async def run_workflow(query: str, files: list[str], logger) -> str:
         "steps": [],
         "iteration": 1,
         "response": "",
-        "final_answer": ""
+        "final_answer": "",
+        "mcp_manager": mcp_manager   
     }
 
     logger.info("Starting workflow for query: %s", query)
 
-    final_state = await graph.ainvoke(initial_state)
+    try:
+        final_state = await graph.ainvoke(initial_state)
 
-    logger.info("Final state steps: %s", final_state["steps"])
-    logger.info("Workflow completed for query: %s", query)
+        final_answer = final_state.get("final_answer", "")
+    
+        logger.info("Workflow completed for query: %s", query)
 
-    return final_state.get("final_answer")
+        return final_answer
+
+    except Exception as e:
+        logger.error("Workflow failed: %s", str(e))
+
+        raise e

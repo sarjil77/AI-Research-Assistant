@@ -1,5 +1,6 @@
-from typing import TypedDict, List
-from schemas.document import Document 
+from schemas.document import Document
+from typing import TypedDict, List, Any
+from typing_extensions import NotRequired
 
 class AgentState(TypedDict):
     query: str
@@ -10,3 +11,4 @@ class AgentState(TypedDict):
     iteration: int
     response: str
     final_answer: str
+    mcp_manager: NotRequired[Any]
